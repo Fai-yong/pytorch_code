@@ -74,50 +74,71 @@ from torch import nn
 import torch
 from torch import nn
 
-class Attention(nn.Module):
-    def __init__(self, heads, embedding_dim):
+class MHA(nn.Module):
+    def __init__(self, heads, dim, droup_out = 0.1):
         super().__init__()
-
         self.heads = heads
-        self.head_dim = embedding_dim // heads
+        self.scale = (dim // heads) ** -0.5
+        self.q_proj = nn.Linear(dim, dim)
+        self.k_proj = nn.Linear(dim, dim)
+        self.v_proj = nn.Linear(dim, dim)
 
-        assert(self.head_dim * heads == embedding_dim)
+        self.out_proj = nn.Linear(dim, dim)
+        self.drop_out = nn.Dropout(droup_out)
 
-        self.q_proj = nn.Linear(embedding_dim, embedding_dim)
-        self.k_proj = nn.Linear(embedding_dim, embedding_dim)
-        self.v_proj = nn.Linear(embedding_dim, embedding_dim)
-        self.o_linear = nn.Linear(embedding_dim, embedding_dim)
-    
-    def forward(self, query:torch.Tensor, key:torch.Tensor):
+    def forward(self, x, casual_mask=None, padding_mask = None):
+        # 联合proj
+        # B, N, D = x.shape
+        # qkv_proj = self.q_proj(x) + self.k_proj(x) + self.v_proj(x) # shape: (B, N, 3D)
+        B, N, D = x.shape
+        q = self.q_proj(x)  # shape: (B, N, D)
+        k = self.k_proj(x)  # shape: (B, N, D)
+        v = self.v_proj(x)  # shape: (B, N, D)
 
-        q_len, k_len = query.shape[1], query.shape[1]
-        batch_size = query.shape[0]
+        query = q.view(B, N, self.heads, D // self.heads).permute(0, 2, 1, 3)  # shape: (B, heads, N, D//heads)
+        key = k.view(B, N, self.heads, D // self.heads).permute(0, 2, 1, 3)  # shape: (B, heads, N, D//heads)
+        value = v.view(B, N, self.heads, D // self.heads).permute(0, 2, 1, 3)  # shape: (B, heads, N, D//heads)
 
-        query = self.q_proj(query)
-        key = self.k_proj(key)
-        value = self.v_proj(key)
 
-        query = query.view(batch_size, -1, self.heads, self.head_dim).transpose(1,2)
-        key = key.view(batch_size, -1, self.heads, self.head_dim).transpose(1,2)
-        value = value.view(batch_size, -1, self.heads, self.head_dim).transpose(1,2)
-
-        # [B, h, q, h_d], [B, h, k, h_d]
-        scale = torch.tensor(self.head_dim, dtype=torch.float32)
-        score = torch.matmul(query, key.transpose(-1, -2)) / torch.sqrt(scale)
-        attention = torch.softmax(score, dim=-1)
-
-        # B,H,q,k * B,H,k,h_d -> B,H,q,h_d
-        output = torch.matmul(attention, value)
-
-        # B,H,q,h_d -> B,q,H,h_d -> B,q,d
-        output = output.transpose(1,2)
-        print(output.shape)
-        output = output.reshape(batch_size,-1,self.head_dim * self.heads)
-
-        return self.o_linear(output)
+        # query: [B, heads, N, D//heads]
+        # key.transpose(-2, -1): [B, heads, D//heads, N]
+        attn = torch.matmul(query, key.transpose(-2, -1)) * self.scale  # shape: (B, heads, N, N)
+        attn = attn.softmax(dim = -1)
+        attn = self.drop_out(attn)
+        # attn: (B, heads, N, N), value: (B, heads, N, D//heads)
+        out = torch.matmul(attn, value).transpose(1,2).reshape(B, N, D) 
+        # (B, heads, N, D//heads) -> (B, N, D)
+        return self.out_proj(out)
 
 
 
+
+
+
+class ViT_Attention(nn.Module):
+    def __init__(self, dim, heads=8, dropout=0.1):
+        super().__init__()
+        self.heads = heads
+        self.scale = (dim // heads) ** -0.5
+        self.to_qkv = nn.Linear(dim, dim * 3)
+        self.out = nn.Linear(dim, dim)
+        self.dropout = nn.Dropout(dropout)
+
+    def forward(self, x):
+        B, N, D = x.shape
+        qkv = self.to_qkv(x)  # (B, N, 3D)
+        qkv = qkv.reshape(B, N, 3, self.heads, D // self.heads).permute(2, 0, 3, 1, 4)
+        # qkv: [3, B, heads, N, D/heads]
+
+        q, k, v = qkv[0], qkv[1], qkv[2]
+        # q, k, v: [B, H, N, D/heads]
+
+        # attn = (q @ k.transpose(-2, -1)) * self.scale
+        attn = torch.matmul(q, k.transpose(-2, -1)) * self.scale
+        attn = attn.softmax(dim=-1)
+        attn = self.dropout(attn)
+        out = torch.matmul(attn, v).transpose(1, 2).reshape(B, N, D)
+        return self.out(out)
 
 
 
@@ -135,15 +156,19 @@ def test_MHA():
     # causal_mask = torch.triu(torch.ones(seq_len, seq_len), diagonal=1).bool()
     
     # 创建多头注意力模块
-    mha = Attention(num_heads, hidden_size)
+    mha = MHA(heads=num_heads, dim=hidden_size)
+    vit_attn = ViT_Attention(heads=num_heads, dim=hidden_size)
 
     # 计算多头注意力输出
-    output = mha(hidden_state, hidden_state)
+    output = mha(hidden_state)
+    vit_attn_out = vit_attn(hidden_state)
     
     print("Input shape:", hidden_state.shape)
     print("Output shape:", output.shape)
-    print("Input tensor:", hidden_state)
-    print("Output tensor:", output)
+    # print("Input tensor:", hidden_state)
+    # print("Output tensor:", output)
+
+    print("vit Output shape", vit_attn_out.shape)
     
 if __name__ == "__main__":
 	test_MHA()
